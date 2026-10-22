@@ -194,12 +194,31 @@ impl VerificationContract {
     // Admin
     // -------------------------------------------------------------------------
 
+    // -------------------------------------------------------------------------
+    // Constructor (atomic deployment + initialization — issue #1369)
+    // -------------------------------------------------------------------------
+
+    /// Soroban constructor: called atomically during `stellar contract deploy`.
+    /// Eliminates the front-running window between deploy and initialize.
+    /// See `docs/DEPLOYMENT.md` and `docs/VERSIONING.md`.
+    pub fn __constructor(env: Env, admin: Address) {
+        Self::init_state(&env, &admin);
+    }
+
+    /// One-time contract initialisation. Kept for backward compatibility with
+    /// already-deployed contracts. Returns `AlreadyInitialized` if the
+    /// constructor already ran. New deployments should rely on the constructor.
     pub fn initialize(env: Env, admin: Address) -> Result<(), VerificationError> {
         if env.storage().instance().has(&DataKey::Initialized) {
             return Err(VerificationError::AlreadyInitialized);
         }
         admin.require_auth();
-        env.storage().persistent().set(&DataKey::Admin, &admin);
+        Self::init_state(&env, &admin);
+        Ok(())
+    }
+
+    fn init_state(env: &Env, admin: &Address) {
+        env.storage().persistent().set(&DataKey::Admin, admin);
         env.storage().persistent().extend_ttl(
             &DataKey::Admin,
             ADMIN_BUMP_LEDGERS,
@@ -219,8 +238,7 @@ impl VerificationContract {
         env.storage()
             .instance()
             .set(&DataKey::ActiveDisputesCount, &0u32);
-        events::contract_initialized(&env, &admin);
-        Ok(())
+        events::contract_initialized(env, admin);
     }
 
     /// Propose a replacement administrator. The current admin remains active
@@ -3136,6 +3154,98 @@ impl VerificationContract {
         Ok(())
     }
 
+    // -------------------------------------------------------------------------
+    // GDPR right-to-erasure (issue #1373)
+    // -------------------------------------------------------------------------
+
+    /// Paged erasure of a player's verification state (admin only).
+    ///
+    /// Removes `Milestone`, `MilestoneCounter`, `PlayerAffiliations`,
+    /// `PlayerDisputes`, and `MilestoneDispute` records for the player up to
+    /// `limit` entries per call. Pass the returned `next_cursor` back until
+    /// `more == false`. Safe to call repeatedly; already-absent keys are skipped.
+    ///
+    /// **Note:** Ledger history is immutable — this only removes current-state
+    /// entries. See `docs/PLAYER_ERASURE.md` for the legal/product sign-off.
+    pub fn purge_player_data(
+        env: Env,
+        player_id: u64,
+        cursor: u32,
+    ) -> Result<(u32, bool), VerificationError> {
+        let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+
+        const PAGE_SIZE: u32 = 50;
+        let mut removed: u32 = 0;
+
+        // On the first page remove the non-milestone keys.
+        if cursor == 0 {
+            if env
+                .storage()
+                .persistent()
+                .has(&DataKey::PlayerAffiliations(player_id))
+            {
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::PlayerAffiliations(player_id));
+                removed += 1;
+            }
+            if env
+                .storage()
+                .persistent()
+                .has(&DataKey::PlayerDisputes(player_id))
+            {
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::PlayerDisputes(player_id));
+                removed += 1;
+            }
+        }
+
+        let total: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MilestoneCounter(player_id))
+            .unwrap_or(0u32);
+
+        let start = cursor;
+        let end = (start + PAGE_SIZE).min(total);
+
+        for idx in start..end {
+            // Remove milestone record.
+            let mk = DataKey::Milestone(player_id, idx);
+            if env.storage().persistent().has(&mk) {
+                env.storage().persistent().remove(&mk);
+                removed += 1;
+            }
+            // Remove any associated dispute.
+            let dk = DataKey::MilestoneDispute(player_id, idx);
+            if env.storage().persistent().has(&dk) {
+                env.storage().persistent().remove(&dk);
+                removed += 1;
+            }
+        }
+
+        let next_cursor = end;
+        let more = next_cursor < total;
+
+        // On final page remove the counter itself.
+        if !more {
+            if env
+                .storage()
+                .persistent()
+                .has(&DataKey::MilestoneCounter(player_id))
+            {
+                env.storage()
+                    .persistent()
+                    .remove(&DataKey::MilestoneCounter(player_id));
+                removed += 1;
+            }
+        }
+
+        events::player_data_purged(&env, &admin, player_id, removed, more);
+        Ok((next_cursor, more))
+    }
+
     pub fn health(env: Env) -> ContractHealth {
         let initialized = env
             .storage()
@@ -5104,7 +5214,7 @@ mod tests {
                 (
                     client.address.clone(),
                     (
-                        Symbol::new(&env, events::ADMIN_TRANSFER_PROPOSED),
+                        Symbol::new(&env, "AdminTransferProposed"),
                         old_admin.clone(),
                     )
                         .into_val(&env),
@@ -5149,7 +5259,7 @@ mod tests {
                 (
                     client.address.clone(),
                     (
-                        Symbol::new(&env, events::ADMIN_TRANSFERRED),
+                        Symbol::new(&env, "AdminTransferred"),
                         old_admin.clone(),
                     )
                         .into_val(&env),
@@ -5988,7 +6098,7 @@ mod tests {
                 (
                     client.address.clone(),
                     (
-                        Symbol::new(&env, crate::events::CONTRACT_PAUSED),
+                        Symbol::new(&env, "ContractPaused"),
                         admin.clone(),
                     )
                         .into_val(&env),
@@ -6006,7 +6116,7 @@ mod tests {
                 (
                     client.address.clone(),
                     (
-                        Symbol::new(&env, crate::events::CONTRACT_UNPAUSED),
+                        Symbol::new(&env, "ContractUnpaused"),
                         admin.clone(),
                     )
                         .into_val(&env),
@@ -6060,7 +6170,7 @@ mod tests {
                 (
                     client.address.clone(),
                     (
-                        Symbol::new(&env, crate::events::PROGRESS_CONTRACT_UPDATED),
+                        Symbol::new(&env, "ProgressContractUpdated"),
                         admin.clone(),
                     )
                         .into_val(&env),
@@ -6069,7 +6179,7 @@ mod tests {
                 (
                     client.address.clone(),
                     (
-                        Symbol::new(&env, crate::events::WIRING_UPDATED),
+                        Symbol::new(&env, "WiringUpdated"),
                         admin.clone(),
                         Symbol::new(&env, "progress_contract"),
                     )
@@ -6210,7 +6320,7 @@ mod tests {
                 (
                     client.address.clone(),
                     (
-                        Symbol::new(&env, crate::events::WIRING_UPDATED),
+                        Symbol::new(&env, "WiringUpdated"),
                         admin.clone(),
                         Symbol::new(&env, "registration_contract"),
                     )
@@ -6300,7 +6410,7 @@ mod tests {
                 (
                     client.address.clone(),
                     (
-                        Symbol::new(&env, crate::events::CONTRACT_INITIALIZED),
+                        Symbol::new(&env, "ContractInitialized"),
                         admin.clone(),
                     )
                         .into_val(&env),
@@ -7096,7 +7206,7 @@ mod tests {
                 (
                     client.address.clone(),
                     (
-                        Symbol::new(&env, crate::events::DISPUTE_RESOLVED),
+                        Symbol::new(&env, "DisputeResolved"),
                         admin.clone(),
                     )
                         .into_val(&env),
