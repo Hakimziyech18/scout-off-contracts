@@ -438,6 +438,9 @@ impl ScoutAccessContract {
     pub fn pause_contract(env: Env) -> Result<(), ScoutAccessError> {
         Self::bump_instance_ttl(&env);
         let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+        if env.storage().instance().get::<_, bool>(&DataKey::Paused).unwrap_or(false) == true {
+            return Ok(());
+        }
         env.storage().instance().set(&DataKey::Paused, &true);
         events::contract_paused(&env, &admin);
         Ok(())
@@ -446,6 +449,9 @@ impl ScoutAccessContract {
     pub fn unpause_contract(env: Env) -> Result<(), ScoutAccessError> {
         Self::bump_instance_ttl(&env);
         let admin = require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+        if env.storage().instance().get::<_, bool>(&DataKey::Paused).unwrap_or(false) == false {
+            return Ok(());
+        }
         env.storage().instance().set(&DataKey::Paused, &false);
         events::contract_unpaused(&env, &admin);
         Ok(())
@@ -466,6 +472,9 @@ impl ScoutAccessContract {
             .persistent()
             .get(&DataKey::Admin)
             .ok_or(ScoutAccessError::NotInitialized)?;
+        if env.storage().instance().get::<_, bool>(&DataKey::PausedPayToContact).unwrap_or(false) == true {
+            return Ok(());
+        }
         env.storage()
             .instance()
             .set(&DataKey::PausedPayToContact, &true);
@@ -483,6 +492,9 @@ impl ScoutAccessContract {
             .persistent()
             .get(&DataKey::Admin)
             .ok_or(ScoutAccessError::NotInitialized)?;
+        if env.storage().instance().get::<_, bool>(&DataKey::PausedPayToContact).unwrap_or(false) == false {
+            return Ok(());
+        }
         env.storage()
             .instance()
             .set(&DataKey::PausedPayToContact, &false);
@@ -1714,10 +1726,14 @@ impl ScoutAccessContract {
     /// backlog cannot exceed the CPU-instruction budget in a single
     /// invocation — call repeatedly to drain a larger backlog. Entries not
     /// yet past `expires_at` are left in place for a later call. Returns the
-    /// number of escrows actually swept.
+    /// number of escrows actually swept. `limit == 0` returns `InvalidInput`.
     pub fn expire_trial_offers(env: Env, limit: u32) -> Result<u32, ScoutAccessError> {
         Self::bump_instance_ttl(&env);
         require_admin(&env, &DataKey::Admin, ADMIN_BUMP_LEDGERS)?;
+        // State-changing batch: `limit == 0` is rejected (pagination convention, #1720).
+        if limit == 0 {
+            return Err(ScoutAccessError::InvalidInput);
+        }
 
         let cap = limit.min(EXPIRE_TRIAL_OFFERS_MAX_LIMIT);
         let index_key = DataKey::OutstandingTrialEscrows;
