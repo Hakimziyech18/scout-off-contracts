@@ -3357,16 +3357,16 @@ impl VerificationContract {
             .instance()
             .get::<DataKey, Address>(&DataKey::RegistrationContract)
             .ok_or(VerificationError::RegistrationCallFailed)?;
-        let args: Vec<Val> = (player_id,).into_val(&env);
-        let profile: RegPlayerProfile = env
-            .try_invoke_contract::<RegPlayerProfile, VerificationError>(
+        let args: Vec<Val> = (player_wallet.clone(),).into_val(&env);
+        let owner_player_id: u64 = env
+            .try_invoke_contract::<u64, VerificationError>(
                 &reg_addr,
-                &Symbol::new(&env, "get_player"),
+                &Symbol::new(&env, "get_player_id_by_wallet"),
                 args,
             )
             .map_err(|_| VerificationError::RegistrationCallFailed)?
             .map_err(|_| VerificationError::RegistrationCallFailed)?;
-        if profile.wallet != player_wallet {
+        if owner_player_id != player_id {
             return Err(VerificationError::Unauthorized);
         }
 
@@ -5167,6 +5167,7 @@ mod tests {
     #[contracttype]
     enum StubKey {
         Owner,
+        PlayerId,
     }
 
     #[contractimpl]
@@ -5193,6 +5194,16 @@ mod tests {
             }
         }
 
+        pub fn get_player_id_by_wallet(env: Env, wallet: Address) -> u64 {
+            let owner: Address = env.storage().persistent().get(&StubKey::Owner).unwrap();
+            if wallet != owner {
+                return 0u64;
+            }
+            env.storage().persistent().get(&StubKey::PlayerId).unwrap_or(1u64)
+        }
+        pub fn set_player_id(env: Env, player_id: u64) {
+            env.storage().persistent().set(&StubKey::PlayerId, &player_id);
+        }
         pub fn is_player_deactivated(_env: Env, _player_id: u64) -> bool {
             false
         }
@@ -5205,11 +5216,12 @@ mod tests {
         env: &Env,
         client: &VerificationContractClient<'static>,
         owner: &Address,
-    ) {
+    ) -> Address {
         let reg_id = env.register(RegStub, ());
         let reg_client = RegStubClient::new(env, &reg_id);
         reg_client.initialize(owner);
         client.set_registration_contract(&reg_id);
+        reg_id
     }
 
     // A valid 46-character CIDv0 for use in tests.
@@ -5236,6 +5248,91 @@ mod tests {
             c1, c2
         );
         String::from_str(env, &s)
+    }
+
+    // #1695 — historical unique milestone count, not active count or rounds.
+    fn setup_dispute_count_scenario() -> (Env, VerificationContractClient<'static>, Address) {
+        let (env, client) = setup();
+        let admin = Address::generate(&env);
+        let wallet = Address::generate(&env);
+        client.initialize(&admin);
+        setup_with_registration(&env, &client, &wallet);
+        let validator = Address::generate(&env);
+        client.register_validator(
+            &validator,
+            &String::from_str(&env, "Coach A License"),
+            &String::from_str(&env, "Default Academy"),
+            &Vec::new(&env),
+        );
+        client.approve_milestone(
+            &validator, &1u64, &String::from_str(&env, "Milestone A"),
+            &String::from_str(&env, VALID_CID_V0), &None,
+        );
+        client.approve_milestone(
+            &validator, &1u64, &String::from_str(&env, "Milestone B"),
+            &String::from_str(&env, VALID_CID_V0_2), &None,
+        );
+        (env, client, wallet)
+    }
+
+    #[test]
+    fn test_get_player_dispute_count_zero_before_any_disputes() {
+        let (env, client) = setup();
+        client.initialize(&Address::generate(&env));
+        assert_eq!(client.get_player_dispute_count(&1u64), 0);
+    }
+
+    #[test]
+    fn test_get_player_dispute_count_unknown_player_is_zero() {
+        let (_env, client, _) = setup_dispute_count_scenario();
+        assert_eq!(client.get_player_dispute_count(&9_999u64), 0);
+        assert_eq!(client.get_player_dispute_count(&1u64), 0);
+    }
+
+    #[test]
+    fn test_get_player_dispute_count_two_open_milestones_is_two() {
+        let (env, client, wallet) = setup_dispute_count_scenario();
+        for i in 1..=2u32 {
+            client.dispute_milestone(
+                &wallet, &1u64, &i, &String::from_str(&env, "Ownership"), &0u32,
+            );
+        }
+        assert_eq!(client.get_player_dispute_count(&1u64), 2);
+        assert_eq!(client.get_active_disputes_count(), 2);
+        assert_eq!(client.get_player_disputes(&1u64, &0u32, &10u32).len(), 2);
+    }
+
+    #[test]
+    fn test_get_player_dispute_count_resolve_one_keeps_historical_two() {
+        let (env, client, wallet) = setup_dispute_count_scenario();
+        for i in 1..=2u32 {
+            client.dispute_milestone(
+                &wallet, &1u64, &i, &String::from_str(&env, "Ownership"), &0u32,
+            );
+        }
+        client.resolve_dispute(&1u64, &1u32, &false);
+        assert_eq!(client.get_player_dispute_count(&1u64), 2);
+        assert_eq!(client.get_active_disputes_count(), 1);
+        assert!(client.get_dispute(&1u64, &1u32).resolved);
+    }
+
+    #[test]
+    fn test_get_player_dispute_count_reopen_round_does_not_add_milestone() {
+        let (env, client, wallet) = setup_dispute_count_scenario();
+        client.dispute_milestone(
+            &wallet, &1u64, &1u32, &String::from_str(&env, "First"), &0u32,
+        );
+        client.resolve_dispute(&1u64, &1u32, &false);
+        let resolved_at = client.get_dispute(&1u64, &1u32).resolved_at;
+        env.ledger().with_mut(|l| {
+            l.timestamp = resolved_at + DISPUTE_REOPEN_COOLDOWN_SECS + 1;
+        });
+        client.dispute_milestone(
+            &wallet, &1u64, &1u32, &String::from_str(&env, "Again"), &0u32,
+        );
+        assert_eq!(client.get_player_dispute_count(&1u64), 1);
+        assert_eq!(client.get_active_disputes_count(), 1);
+        assert_eq!(client.get_dispute(&1u64, &1u32).round, 1);
     }
 
     #[test]
@@ -7142,7 +7239,7 @@ mod tests {
         let admin = Address::generate(&env);
         let player_wallet = Address::generate(&env);
         client.initialize(&admin);
-        setup_with_registration(&env, &client, &player_wallet);
+        let reg_id = setup_with_registration(&env, &client, &player_wallet);
 
         let validator = Address::generate(&env);
         client.register_validator(
@@ -7169,6 +7266,7 @@ mod tests {
 
         assert_eq!(client.get_active_disputes_count(), 0);
 
+        RegStubClient::new(&env, &reg_id).set_player_id(&1u64);
         client.dispute_milestone(
             &player_wallet,
             &1u64,
@@ -7178,6 +7276,7 @@ mod tests {
         );
         assert_eq!(client.get_active_disputes_count(), 1);
 
+        RegStubClient::new(&env, &reg_id).set_player_id(&2u64);
         client.dispute_milestone(
             &player_wallet,
             &2u64,
@@ -7196,7 +7295,7 @@ mod tests {
         let admin = Address::generate(&env);
         let player_wallet = Address::generate(&env);
         client.initialize(&admin);
-        setup_with_registration(&env, &client, &player_wallet);
+        let reg_id = setup_with_registration(&env, &client, &player_wallet);
 
         let validator = Address::generate(&env);
         client.register_validator(
@@ -7214,6 +7313,7 @@ mod tests {
             &None,
         );
 
+        RegStubClient::new(&env, &reg_id).set_player_id(&1u64);
         client.dispute_milestone(
             &player_wallet,
             &1u64,
@@ -7224,6 +7324,7 @@ mod tests {
         assert_eq!(client.get_active_disputes_count(), 1);
 
         // Second dispute on the same (player, index) should fail
+        RegStubClient::new(&env, &reg_id).set_player_id(&1u64);
         let result = client.try_dispute_milestone(
             &player_wallet,
             &1u64,
@@ -7242,7 +7343,7 @@ mod tests {
         let admin = Address::generate(&env);
         let player_wallet = Address::generate(&env);
         client.initialize(&admin);
-        setup_with_registration(&env, &client, &player_wallet);
+        let reg_id = setup_with_registration(&env, &client, &player_wallet);
 
         let validator = Address::generate(&env);
         client.register_validator(
@@ -7259,6 +7360,7 @@ mod tests {
             &String::from_str(&env, VALID_CID_V0),
             &None,
         );
+        RegStubClient::new(&env, &reg_id).set_player_id(&1u64);
         client.dispute_milestone(
             &player_wallet,
             &1u64,
@@ -7282,7 +7384,7 @@ mod tests {
         let admin = Address::generate(&env);
         let player_wallet = Address::generate(&env);
         client.initialize(&admin);
-        setup_with_registration(&env, &client, &player_wallet);
+        let reg_id = setup_with_registration(&env, &client, &player_wallet);
 
         let validator = Address::generate(&env);
         client.register_validator(
@@ -7299,6 +7401,7 @@ mod tests {
             &String::from_str(&env, VALID_CID_V0),
             &None,
         );
+        RegStubClient::new(&env, &reg_id).set_player_id(&2u64);
         client.dispute_milestone(
             &player_wallet,
             &2u64,
@@ -7333,7 +7436,7 @@ mod tests {
         let admin = Address::generate(&env);
         let player_wallet = Address::generate(&env);
         client.initialize(&admin);
-        setup_with_registration(&env, &client, &player_wallet);
+        let reg_id = setup_with_registration(&env, &client, &player_wallet);
 
         let validator = Address::generate(&env);
         client.register_validator(
@@ -7352,6 +7455,7 @@ mod tests {
         );
 
         let reason = String::from_str(&env, "Wrong attribution");
+        RegStubClient::new(&env, &reg_id).set_player_id(&2u64);
         client.dispute_milestone(&player_wallet, &2u64, &1u32, &reason, &0u32);
 
         let events = env.events().all();
@@ -7388,7 +7492,7 @@ mod tests {
         let admin = Address::generate(&env);
         let player_wallet = Address::generate(&env);
         client.initialize(&admin);
-        setup_with_registration(&env, &client, &player_wallet);
+        let reg_id = setup_with_registration(&env, &client, &player_wallet);
 
         let validator = Address::generate(&env);
         client.register_validator(
@@ -7405,6 +7509,7 @@ mod tests {
             &String::from_str(&env, VALID_CID_V0),
             &None,
         );
+        RegStubClient::new(&env, &reg_id).set_player_id(&3u64);
         client.dispute_milestone(
             &player_wallet,
             &3u64,
@@ -7435,7 +7540,7 @@ mod tests {
         let admin = Address::generate(&env);
         let player_wallet = Address::generate(&env);
         client.initialize(&admin);
-        setup_with_registration(&env, &client, &player_wallet);
+        let reg_id = setup_with_registration(&env, &client, &player_wallet);
 
         let validator = Address::generate(&env);
         client.register_validator(
@@ -7461,6 +7566,7 @@ mod tests {
         assert!(!client.has_dispute(&player_id, &milestone_index));
 
         // Submit dispute
+        RegStubClient::new(&env, &reg_id).set_player_id(&player_id);
         client.dispute_milestone(
             &player_wallet,
             &player_id,
@@ -7481,7 +7587,7 @@ mod tests {
         let admin = Address::generate(&env);
         let player_wallet = Address::generate(&env);
         client.initialize(&admin);
-        setup_with_registration(&env, &client, &player_wallet);
+        let reg_id = setup_with_registration(&env, &client, &player_wallet);
 
         let validator = Address::generate(&env);
         client.register_validator(
@@ -7508,6 +7614,7 @@ mod tests {
         );
 
         // Dispute only the first milestone
+        RegStubClient::new(&env, &reg_id).set_player_id(&1u64);
         client.dispute_milestone(
             &player_wallet,
             &1u64,
@@ -7533,7 +7640,7 @@ mod tests {
         let admin = Address::generate(&env);
         let player_wallet = Address::generate(&env);
         client.initialize(&admin);
-        setup_with_registration(&env, &client, &player_wallet);
+        let reg_id = setup_with_registration(&env, &client, &player_wallet);
 
         let validator = Address::generate(&env);
         client.register_validator(
@@ -7562,6 +7669,7 @@ mod tests {
             &None,
         );
 
+        RegStubClient::new(&env, &reg_id).set_player_id(&disputed_player_id);
         client.dispute_milestone(
             &player_wallet,
             &disputed_player_id,
@@ -7598,7 +7706,7 @@ mod tests {
         let player_wallet = Address::generate(&env);
         let attacker_wallet = Address::generate(&env);
         client.initialize(&admin);
-        setup_with_registration(&env, &client, &player_wallet);
+        let reg_id = setup_with_registration(&env, &client, &player_wallet);
 
         let validator = Address::generate(&env);
         client.register_validator(
@@ -7640,7 +7748,7 @@ mod tests {
         let admin = Address::generate(&env);
         let player_wallet = Address::generate(&env);
         client.initialize(&admin);
-        setup_with_registration(&env, &client, &player_wallet);
+        let reg_id = setup_with_registration(&env, &client, &player_wallet);
 
         let validator = Address::generate(&env);
         client.register_validator(
@@ -7663,6 +7771,7 @@ mod tests {
         );
 
         // Correct wallet disputes — must succeed
+        RegStubClient::new(&env, &reg_id).set_player_id(&player_id);
         let result = client.try_dispute_milestone(
             &player_wallet,
             &player_id,
@@ -8374,7 +8483,7 @@ mod tests {
         let admin = Address::generate(&env);
         let player_wallet = Address::generate(&env);
         client.initialize(&admin);
-        setup_with_registration(&env, &client, &player_wallet);
+        let reg_id = setup_with_registration(&env, &client, &player_wallet);
 
         let validator = Address::generate(&env);
         client.register_validator(
@@ -8393,6 +8502,7 @@ mod tests {
         );
 
         // First dispute — should succeed.
+        RegStubClient::new(&env, &reg_id).set_player_id(&1u64);
         client.dispute_milestone(
             &player_wallet,
             &1u64,
@@ -8403,6 +8513,7 @@ mod tests {
 
         // Second dispute on the same (player_id=1, milestone_index=1) must
         // return the distinct DisputeAlreadyExists error, not InvalidInput.
+        RegStubClient::new(&env, &reg_id).set_player_id(&1u64);
         let result = client.try_dispute_milestone(
             &player_wallet,
             &1u64,
