@@ -1,9 +1,22 @@
 #!/usr/bin/env bash
 # ScoutChain — deploy all contracts to Stellar testnet or mainnet
-# Usage: ./scripts/deploy.sh [testnet|mainnet|local]
+# Usage: ./scripts/deploy.sh [testnet|mainnet|local] [--allow-cli-mismatch]
 set -euo pipefail
 
-source "$(dirname "$0")/network.sh" "${1:-}"
+NETWORK_ARG=""
+ALLOW_CLI_MISMATCH=0
+for arg in "$@"; do
+  case "$arg" in
+    --allow-cli-mismatch) ALLOW_CLI_MISMATCH=1 ;;
+    *) NETWORK_ARG="$arg" ;;
+  esac
+done
+
+source "$(dirname "$0")/network.sh" "$NETWORK_ARG"
+
+# shellcheck source=lib/check-stellar-cli.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/check-stellar-cli.sh"
+check_stellar_cli_version "$ALLOW_CLI_MISMATCH"
 DEPLOYER="${DEPLOYER_SECRET:-}"
 
 if [[ -z "$DEPLOYER" ]]; then
@@ -45,7 +58,7 @@ if [[ -n "$PREBUILT_WASM_DIR" ]]; then
   echo "==> Using prebuilt WASMs from $WASM_DIR (skipping build and optimize)"
 else
   echo "==> Building contracts..."
-  cargo build --workspace --target wasm32v1-none --release
+  cargo build --workspace --target wasm32v1-none --release --locked
 fi
 
 CONTRACTS=(registration verification progress scout_access)
