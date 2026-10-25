@@ -112,7 +112,7 @@ app.post(
     let jti: string;
 
     try {
-      const payload = jwt.verify(token, config.jwtSecret) as {
+      const payload = jwt.verify(token, config.jwtSecret, { algorithms: ["HS256"] }) as {
         jti?: string;
       };
       if (!payload.jti) {

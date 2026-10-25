@@ -44,7 +44,7 @@ export async function requireAuth(
   const token = authHeader.split(" ")[1];
 
   try {
-    const payload = jwt.verify(token, config.jwtSecret) as {
+    const payload = jwt.verify(token, config.jwtSecret, { algorithms: ["HS256"] }) as {
       sub: string;
       role: string;
       jti?: string;
